@@ -64,9 +64,22 @@ if __name__ == "__main__":
 
             if total_iters % opt.print_freq == 0:  # print training losses and save logging information to the disk
                 losses = model.get_current_losses()
+                
+                # --- 新增代码: 获取指标 ---
+                # 检查 model 是否有 get_current_metrics 方法 (已在 pix2pix_model.py 中添加)
+                if hasattr(model, 'get_current_metrics'):
+                    metrics = model.get_current_metrics()
+                else:
+                    metrics = {} # 如果没有，则为空字典
+                
                 t_comp = (time.time() - iter_start_time) / opt.batch_size
-                visualizer.print_current_losses(epoch, epoch_iter, losses, t_comp, t_data)
-                visualizer.plot_current_losses(total_iters, losses)
+                
+                # --- 修改: 传递 losses 和 metrics 到打印函数 ---
+                visualizer.print_current_losses(epoch, epoch_iter, losses, t_comp, t_data, metrics=metrics)
+                
+                # --- 修改: 合并 losses 和 metrics 字典进行绘图 ---
+                all_logs = {**losses, **metrics}
+                visualizer.plot_current_losses(total_iters, all_logs)
 
             if total_iters % opt.save_latest_freq == 0:  # cache our latest model every <save_latest_freq> iterations
                 print(f"saving the latest model (epoch {epoch}, total_iters {total_iters})")

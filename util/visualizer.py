@@ -132,20 +132,21 @@ class Visualizer:
             webpage.save()
 
     def plot_current_losses(self, total_iters, losses):
-        """Log current losses to wandb
+        """Log current losses (and metrics) to wandb
 
         Parameters:
             total_iters (int)     -- current training iteration during this epoch
-            losses (OrderedDict)  -- training losses stored in the format of (name, float) pairs
+            losses (OrderedDict)  -- training losses and metrics stored in the format of (name, float) pairs
         """
         # Only plot losses on main process (rank 0)
         if dist.is_initialized() and dist.get_rank() != 0:
             return
 
         if self.use_wandb:
+            # losses 字典现在包含了 losses 和 metrics
             self.wandb_run.log(losses, step=total_iters)
 
-    def print_current_losses(self, epoch, iters, losses, t_comp, t_data):
+    def print_current_losses(self, epoch, iters, losses, t_comp, t_data, metrics=None):
         """print current losses on console; also save the losses to the disk
 
         Parameters:
@@ -154,15 +155,33 @@ class Visualizer:
             losses (OrderedDict) -- training losses stored in the format of (name, float) pairs
             t_comp (float) -- computational time per data point (normalized by batch_size)
             t_data (float) -- data loading time per data point (normalized by batch_size)
+            metrics (dict, optional) -- New evaluation metrics (e.g., PSNR, SSIM).
         """
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         message = f"[Rank {local_rank}] (epoch: {epoch}, iters: {iters}, time: {t_comp:.3f}, data: {t_data:.3f}) "
+        
+        # 打印/记录 Losses
         for k, v in losses.items():
             message += f", {k}: {v:.3f}"
+        
+        # --- 新增: 打印/记录 Metrics ---
+        if metrics is not None:
+             for k, v in metrics.items():
+                message += f", {k}: {v:.4f}" # PSNR/SSIM通常保留四位小数
+        # --- 结束新增 ---
+            
         message += "\n"
         print(message)  # print the message on ALL ranks with rank info
 
         # Only save to log file on main process (rank 0)
         if local_rank == 0:
             with open(self.log_name, "a") as log_file:
-                log_file.write(f"{message}\n")  # save the message
+                # 准备 log 文件信息 (不带 rank 信息)
+                log_message_to_file = f"(epoch: {epoch}, iters: {iters}, time: {t_comp:.3f}, data: {t_data:.3f}) "
+                for k, v in losses.items():
+                    log_message_to_file += f", {k}: {v:.3f}"
+                if metrics is not None:
+                    for k, v in metrics.items():
+                        log_message_to_file += f", {k}: {v:.4f}"
+                
+                log_file.write(f"{log_message_to_file}\n")

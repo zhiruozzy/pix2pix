@@ -1,6 +1,8 @@
 import torch
 from .base_model import BaseModel
 from . import networks
+from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
+import numpy as np
 
 
 class Pix2PixModel(BaseModel):
@@ -37,6 +39,49 @@ class Pix2PixModel(BaseModel):
 
         return parser
 
+    # --- 新增: train.py 期望调用的公共接口 ---
+    def get_current_metrics(self):
+        """返回当前的 PSNR 和 SSIM 值 (以字典形式)"""
+        return self._calculate_metrics()
+
+    # --- 原 calculate_metrics 重命名为内部方法 ---
+    def _calculate_metrics(self):
+        """计算 PSNR 和 SSIM (原 calculate_metrics)"""
+        
+        # 安全检查
+        if not hasattr(self, 'real_B') or self.real_B.shape[0] == 0:
+            return {}
+            
+        # 将张量从 GPU 移动到 CPU，并转换为 NumPy 数组
+        # 移除批次维度 (Batch dimension)
+        # B 是真实图像 (Ground Truth)，fake_B 是生成图像
+        real_B_np = self.real_B[0].cpu().detach().numpy().transpose(1, 2, 0)
+        fake_B_np = self.fake_B[0].cpu().detach().numpy().transpose(1, 2, 0)
+
+        # 我们的数据是归一化到 [-1, 1] 的浮点数。
+        DATA_RANGE = 2.0
+        
+        # 1. PSNR (Peak Signal-to-Noise Ratio)
+        # PSNR 要求输入是 HxW 或 HxWxC
+        psnr_value = psnr(real_B_np, fake_B_np, data_range=DATA_RANGE)
+        
+        # 2. SSIM (Structural Similarity Index Measure)
+        # 由于我们是单通道图像 (C=1)，我们先移除 C 维度
+        if real_B_np.shape[-1] == 1:
+            real_B_np = real_B_np.squeeze(-1) # H x W x 1 -> H x W
+            fake_B_np = fake_B_np.squeeze(-1)
+
+        ssim_value = ssim(
+            real_B_np,  
+            fake_B_np,  
+            data_range=DATA_RANGE,
+            multichannel=False # 确保对单通道图像进行正确计算
+        )
+        
+        # 返回格式化后的结果
+        return {'PSNR': float(f'{psnr_value:.4f}'), 'SSIM': float(f'{ssim_value:.4f}')}
+
+
     def __init__(self, opt):
         """Initialize the pix2pix class.
 
@@ -46,7 +91,12 @@ class Pix2PixModel(BaseModel):
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
         self.loss_names = ["G_GAN", "G_L1", "D_real", "D_fake"]
-        # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
+        
+        # --- 修正: 确保 self.metric_names 始终被定义，以便可视化器识别 ---
+        # 如果 train.py 调用 get_current_metrics，我们就需要定义这些名称
+        self.metric_names = ['PSNR', 'SSIM'] 
+        # ------------
+            
         self.visual_names = ["real_A", "fake_B", "real_B"]
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>
         if self.isTrain:
