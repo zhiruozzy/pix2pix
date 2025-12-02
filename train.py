@@ -1,23 +1,4 @@
-"""General-purpose training script for image-to-image translation.
-
-This script works for various models (with option '--model': e.g., pix2pix, cyclegan, colorization) and
-different datasets (with option '--dataset_mode': e.g., aligned, unaligned, single, colorization).
-You need to specify the dataset ('--dataroot'), experiment name ('--name'), and model ('--model').
-
-It first creates model, dataset, and visualizer given the option.
-It then does standard network training. During the training, it also visualize/save the images, print/save the loss plot, and save models.
-The script supports continue/resume training. Use '--continue_train' to resume your previous training.
-
-Example:
-    Train a CycleGAN model:
-        python train.py --dataroot ./datasets/maps --name maps_cyclegan --model cycle_gan
-    Train a pix2pix model:
-        python train.py --dataroot ./datasets/facades --name facades_pix2pix --model pix2pix --direction BtoA
-
-See options/base_options.py and options/train_options.py for more training options.
-See training and test tips at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/tips.md
-See frequently asked questions at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/qa.md
-"""
+"""General-purpose training script for image-to-image translation."""
 
 import time
 from options.train_options import TrainOptions
@@ -65,19 +46,19 @@ if __name__ == "__main__":
             if total_iters % opt.print_freq == 0:  # print training losses and save logging information to the disk
                 losses = model.get_current_losses()
                 
-                # --- 新增代码: 获取指标 ---
-                # 检查 model 是否有 get_current_metrics 方法 (已在 pix2pix_model.py 中添加)
+                # --- 修改: 获取指标 ---
+                # 此时 pix2pix_model.py 的 get_current_metrics 已经包含了 Masked PSNR
+                metrics = {}
                 if hasattr(model, 'get_current_metrics'):
                     metrics = model.get_current_metrics()
-                else:
-                    metrics = {} # 如果没有，则为空字典
                 
                 t_comp = (time.time() - iter_start_time) / opt.batch_size
                 
-                # --- 修改: 传递 losses 和 metrics 到打印函数 ---
+                # 将 losses 和 metrics 一起传给 visualizer
+                # 注意：确保你的 visualizer.py 里的 print_current_losses 接受 metrics 参数
                 visualizer.print_current_losses(epoch, epoch_iter, losses, t_comp, t_data, metrics=metrics)
                 
-                # --- 修改: 合并 losses 和 metrics 字典进行绘图 ---
+                # 合并用于绘图
                 all_logs = {**losses, **metrics}
                 visualizer.plot_current_losses(total_iters, all_logs)
 

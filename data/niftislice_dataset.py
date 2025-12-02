@@ -9,112 +9,127 @@ from data.base_dataset import BaseDataset
 
 class NiftiSliceDataset(BaseDataset):
     """
-    用于训练阶段的数据集：从 NIfTI 卷中随机抽取一个 2D 切片，
-    并根据 resample_mode 参数进行中心裁剪或双线性插值到 320x320。
+    修正版：优化了 MRI 和 CT 的归一化策略，专门针对骨骼生成任务。
     """
     
     @staticmethod
     def modify_commandline_options(parser, is_train):
-        """添加 dataset-specific 选项并设置默认值"""
-        # 确保尺寸默认为 320
         parser.set_defaults(crop_size=320, load_size=320) 
-        
-        # *** 命令行选项 ***
         parser.add_argument(
             '--resample_mode', 
             type=str, 
             default='interpolate', 
             choices=['interpolate', 'crop'], 
-            help='How to resize slices to 320x320: "interpolate" (bilinear) or "crop" (center crop).'
+            help='How to resize slices.'
         )
         return parser
 
     def __init__(self, opt):
         BaseDataset.__init__(self, opt)
         
-        self.mr_dir = os.path.join(opt.dataroot, 'train_A')  # 输入 (MR)
-        self.ct_dir = os.path.join(opt.dataroot, 'train_B')  # 目标 (CT)
+        self.mr_dir = os.path.join(opt.dataroot, 'train_A')
+        self.ct_dir = os.path.join(opt.dataroot, 'train_B')
         
-        # 确保文件列表已正确加载
         self.mr_files = sorted([os.path.join(self.mr_dir, f) for f in os.listdir(self.mr_dir) if f.endswith(('.nii', '.nii.gz'))])
         self.ct_files = sorted([os.path.join(self.ct_dir, f) for f in os.listdir(self.ct_dir) if f.endswith(('.nii', '.nii.gz'))])
         
         assert len(self.mr_files) == len(self.ct_files), "MR and CT file counts do not match!"
         
-        self.input_size = 320 # 目标尺寸固定为 320
-        self.resample_mode = opt.resample_mode # *** 存储选择的模式 ***
+        self.input_size = 320
+        self.resample_mode = opt.resample_mode
 
-        # 定义归一化参数 (必须与训练时使用的参数保持一致)
-        self.mr_min, self.mr_max = 0, 1000  
-        self.ct_min, self.ct_max = -1024, 3072
+        # --- 修改点 1: 调整 CT 窗宽窗位 (针对脊柱骨骼优化) ---
+        # 舍弃 > 1500 的高亮金属伪影，舍弃 < -1000 的空气背景
+        # 这样可以让骨骼 (300~1000) 在 [-1, 1] 区间内占据更大的动态范围
+        self.ct_min_val = -1000.0
+        self.ct_max_val = 1500.0 
 
-    def normalize(self, data, min_val, max_val):
-        """将数据归一化到 [-1, 1] 范围"""
-        data = data.astype(np.float32)
+    def normalize_ct(self, data):
+        """CT 使用固定阈值截断 (Clip) + 线性映射"""
+        data = np.clip(data, self.ct_min_val, self.ct_max_val)
+        # 映射到 [0, 1]
+        data = (data - self.ct_min_val) / (self.ct_max_val - self.ct_min_val)
+        # 映射到 [-1, 1]
+        data = data * 2.0 - 1.0
+        return data
+
+    def normalize_mri(self, data):
+        """
+        --- 修改点 2: MRI 使用鲁棒归一化 ---
+        MRI 绝对值无意义，使用 99% 分位数作为 Max，防止个别噪点拉低整体亮度
+        """
+        if data.size == 0: return data
+        
+        min_val = np.percentile(data, 1)  # 1% 分位数作为底 (去底噪)
+        max_val = np.percentile(data, 99) # 99% 分位数作为顶 (去极值)
+        
+        # 防止除以 0
+        if max_val - min_val < 1e-6:
+            return np.zeros_like(data)
+            
+        data = np.clip(data, min_val, max_val)
         data = (data - min_val) / (max_val - min_val)
         data = data * 2.0 - 1.0
-        return np.clip(data, -1.0, 1.0)
+        return data
 
     def __getitem__(self, index):
         # 1. 加载 3D NIfTI 图像
-        mr_vol = nib.load(self.mr_files[index]).get_fdata()
-        ct_vol = nib.load(self.ct_files[index]).get_fdata()
+        # 警告：这里有一个性能瓶颈。每次读取整个 3D 卷只为了取 1 张切片非常慢。
+        # 但为了不改变你的架构，我们先保持这样。
+        mr_obj = nib.load(self.mr_files[index])
+        ct_obj = nib.load(self.ct_files[index])
+        
+        # 确保方向一致 (RAS) - 这是一个好习惯，防止有的图是倒着的
+        mr_obj = nib.as_closest_canonical(mr_obj)
+        ct_obj = nib.as_closest_canonical(ct_obj)
+        
+        mr_vol = mr_obj.get_fdata().astype(np.float32)
+        ct_vol = ct_obj.get_fdata().astype(np.float32)
 
-        # 2. 随机选择切片 (训练阶段必须随机抽样)
-        # 假设 D3 是切片轴 (深度/Z轴)
+        # 2. 随机选择切片 (Z轴)
         D1, D2, D3 = mr_vol.shape 
-        slice_idx = np.random.randint(0, D3) 
+        # 确保 CT 和 MRI 深度一致，如果不一致取最小值 (防止报错)
+        D3_ct = ct_vol.shape[2]
+        slice_idx = np.random.randint(0, min(D3, D3_ct))
         
         mr_slice = mr_vol[:, :, slice_idx] 
         ct_slice = ct_vol[:, :, slice_idx] 
         
-        # 3. 归一化
-        mr_slice_norm = self.normalize(mr_slice, self.mr_min, self.mr_max)
-        ct_slice_norm = self.normalize(ct_slice, self.ct_min, self.ct_max)
+        # 3. 归一化 (使用新的逻辑)
+        mr_slice_norm = self.normalize_mri(mr_slice)
+        ct_slice_norm = self.normalize_ct(ct_slice)
         
         # 4. 转换为 Tensor (C x H x W)
-        mr_tensor = torch.from_numpy(mr_slice_norm).unsqueeze(0) # 1 x H_orig x W_orig
-        ct_tensor = torch.from_numpy(ct_slice_norm).unsqueeze(0) # 1 x H_orig x W_orig
+        mr_tensor = torch.from_numpy(mr_slice_norm).unsqueeze(0) 
+        ct_tensor = torch.from_numpy(ct_slice_norm).unsqueeze(0)
         
-        target_size = self.input_size # 320
+        target_size = self.input_size
         _, H_orig, W_orig = mr_tensor.shape
 
-
-        # 5. 【根据 resample_mode 执行尺寸调整】
-        
+        # 5. Resample logic (保持你原来的逻辑)
         if self.resample_mode == 'crop':
-            # === 中心裁剪逻辑 ===
             if H_orig >= target_size and W_orig >= target_size:
-                # 仅在原始尺寸大于目标尺寸时进行裁剪
                 x_start = (W_orig - target_size) // 2
                 y_start = (H_orig - target_size) // 2
-                
                 mr_tensor_out = mr_tensor[:, y_start:y_start + target_size, x_start:x_start + target_size]
                 ct_tensor_out = ct_tensor[:, y_start:y_start + target_size, x_start:x_start + target_size]
             elif H_orig == target_size and W_orig == target_size:
-                # 尺寸相等，无需操作
                 mr_tensor_out = mr_tensor
                 ct_tensor_out = ct_tensor
             else:
-                # 原始尺寸小于 320x320 (例如 300x300)。裁剪无法实现，使用插值作为回退。
-                print(f"Warning: Slice size {H_orig}x{W_orig} is smaller than 320x320 for cropping. Falling back to interpolation.")
                 mr_tensor_out = F.interpolate(mr_tensor.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False).squeeze(0)
                 ct_tensor_out = F.interpolate(ct_tensor.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False).squeeze(0)
 
-
         elif self.resample_mode == 'interpolate':
-            # === 双线性插值逻辑 (默认) ===
             mr_tensor_out = F.interpolate(mr_tensor.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False).squeeze(0)
             ct_tensor_out = F.interpolate(ct_tensor.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False).squeeze(0)
 
-        # 6. 返回数据
         return {
-            'A': mr_tensor_out,    # 输入 MR (320x320)
-            'B': ct_tensor_out,    # 目标 CT (320x320)
+            'A': mr_tensor_out,    
+            'B': ct_tensor_out,    
             'A_paths': self.mr_files[index], 
             'B_paths': self.ct_files[index]
         }
 
     def __len__(self):
-        # 训练集的长度是 NIfTI 文件的数量
         return len(self.mr_files)

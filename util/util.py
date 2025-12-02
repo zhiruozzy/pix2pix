@@ -128,3 +128,41 @@ def mkdir(path):
         path (str) -- a single directory path
     """
     Path(path).mkdir(parents=True, exist_ok=True)
+
+
+# --- 新增: 计算 Masked PSNR 的工具函数 ---
+def calculate_masked_psnr(fake, real):
+    """
+    计算去除背景的 PSNR
+    :param fake: 生成的图像 (Tensor), 范围 [-1, 1]
+    :param real: 真实的图像 (Tensor), 范围 [-1, 1]
+    :return: 仅计算非背景区域的 PSNR
+    """
+    # 确保不计算梯度
+    with torch.no_grad():
+        # 1. 将数据从 [-1, 1] 转换回 [0, 1]
+        fake = (fake + 1) / 2.0
+        real = (real + 1) / 2.0
+
+        # 2. 制作 Mask (掩膜)
+        # 假设背景是非常黑的。阈值 0.05 (对应原范围的 -0.9)
+        # 只有真实图像 > 0.05 的地方才被认为是有效区域
+        mask = real > 0.05  
+
+        # 3. 如果整张图都是黑的，直接返回 0
+        if torch.sum(mask) == 0:
+            return 0.0
+
+        # 4. 仅在 Mask 区域计算 MSE (均方误差)
+        # masked_select 会把符合条件的像素拉成一维向量
+        diff = torch.masked_select(fake, mask) - torch.masked_select(real, mask)
+        mse = torch.mean(diff ** 2)
+
+        # 5. 计算 PSNR
+        # PSNR = 10 * log10(MAX^2 / MSE)，这里 MAX=1.0
+        if mse == 0:
+            return 100.0  # 完美匹配
+        
+        psnr = 10 * torch.log10(1.0 / mse)
+        
+        return psnr.item()
