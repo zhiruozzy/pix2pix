@@ -3,66 +3,25 @@ from .base_model import BaseModel
 from . import networks
 from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
 import numpy as np
-# 导入 Masked PSNR 计算函数 (保留你之前的实用工具)
+# --- 新增: 导入 Masked PSNR 计算函数 ---
 from util.util import calculate_masked_psnr
 
-
-class GradientLoss(torch.nn.Module):
-    """
-    梯度差分损失 (Gradient Difference Loss, GDL)
-    
-    原理：
-    不仅比较像素值 (L1)，还比较像素的变化率 (梯度)。
-    CT 图像中骨骼边缘梯度变化剧烈，这个 Loss 能强迫模型生成锐利的边缘，
-    防止 L1 Loss 导致的模糊 (Regression-to-Mean)。
-    """
-    def __init__(self):
-        super(GradientLoss, self).__init__()
-        self.criterion = torch.nn.L1Loss()
-
-    def forward(self, x, y):
-        # 1. 计算 X 轴方向的梯度 (右边像素 - 左边像素)
-        # x[:, :, :, :-1] 表示不取最后一列
-        # x[:, :, :, 1:]  表示不取第一列
-        # 两者相减就是相邻像素的差值
-        g_x_x = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
-        g_y_x = torch.abs(y[:, :, :, :-1] - y[:, :, :, 1:])
-        
-        # 2. 计算 Y 轴方向的梯度 (下边像素 - 上边像素)
-        g_x_y = torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
-        g_y_y = torch.abs(y[:, :, :-1, :] - y[:, :, 1:, :])
-        
-        # 3. 计算生成图梯度和真实图梯度的 L1 距离
-        loss_x = self.criterion(g_x_x, g_y_x)
-        loss_y = self.criterion(g_x_y, g_y_y)
-        
-        return loss_x + loss_y
-
-
 class Pix2PixModel(BaseModel):
-    """This class implements the pix2pix model, for learning a mapping from input images to output images given paired data."""
-
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
         parser.set_defaults(norm="batch", netG="unet_256", dataset_mode="aligned")
         if is_train:
-            parser.set_defaults(pool_size=0)
-            
-            # --- 修改 1: 默认使用 lsgan 模式 (解决判别器过强导致梯度消失的问题) ---
-            parser.set_defaults(gan_mode="lsgan") 
-            
-            # L1 Loss 权重
+            parser.set_defaults(pool_size=0, gan_mode="vanilla")
             parser.add_argument("--lambda_L1", type=float, default=100.0, help="weight for L1 loss")
-            
-            # --- 修改 2: 新增 GDL Loss 权重参数 (默认 100.0) ---
-            parser.add_argument("--lambda_GDL", type=float, default=100.0, help="weight for gradient difference loss")
 
         return parser
 
     def get_current_metrics(self):
         """返回当前的 PSNR, SSIM 和 Masked PSNR 值"""
+        # 1. 计算原有的全图指标 (使用 skimage)
         metrics = self._calculate_metrics()
         
+        # 2. 计算 Masked PSNR (使用 PyTorch)
         if hasattr(self, 'real_B') and hasattr(self, 'fake_B'):
             masked_psnr_val = calculate_masked_psnr(self.fake_B, self.real_B)
             metrics['PSNR_Masked'] = masked_psnr_val
@@ -70,7 +29,7 @@ class Pix2PixModel(BaseModel):
         return metrics
 
     def _calculate_metrics(self):
-        """计算标准 PSNR 和 SSIM"""
+        """计算标准 PSNR 和 SSIM (全图计算)"""
         if not hasattr(self, 'real_B') or self.real_B.shape[0] == 0:
             return {}
             
@@ -95,9 +54,9 @@ class Pix2PixModel(BaseModel):
 
     def __init__(self, opt):
         BaseModel.__init__(self, opt)
-        # --- 修改 3: loss_names 中加入 'G_GDL'，移除 'G_VGG' ---
-        self.loss_names = ["G_GAN", "G_L1", "G_GDL", "D_real", "D_fake"]
+        self.loss_names = ["G_GAN", "G_L1", "D_real", "D_fake"]
         
+        # --- 修改: 添加 'PSNR_Masked' 到指标列表 ---
         self.metric_names = ['PSNR', 'SSIM', 'PSNR_Masked'] 
             
         self.visual_names = ["real_A", "fake_B", "real_B"]
@@ -112,13 +71,8 @@ class Pix2PixModel(BaseModel):
             self.netD = networks.define_D(opt.input_nc + opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain)
 
         if self.isTrain:
-            # 这里的 gan_mode 已经被 set_defaults 修改为 'lsgan'
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
             self.criterionL1 = torch.nn.L1Loss()
-            
-            # --- 修改 4: 初始化梯度损失 ---
-            self.criterionGDL = GradientLoss().to(self.device)
-
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
@@ -144,22 +98,11 @@ class Pix2PixModel(BaseModel):
         self.loss_D.backward()
 
     def backward_G(self):
-        # 1. GAN Loss (LSGAN, 因为 gan_mode='lsgan')
-        # 这会让判别器不仅仅是判别真假，而是拉近真假分布的距离，梯度更平滑
         fake_AB = torch.cat((self.real_A, self.fake_B), 1)
         pred_fake = self.netD(fake_AB)
         self.loss_G_GAN = self.criterionGAN(pred_fake, True)
-        
-        # 2. L1 Loss (保证像素准确性)
         self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * self.opt.lambda_L1
-        
-        # 3. --- 新增: Gradient Difference Loss (保证边缘锐利度) ---
-        # 这里的 lambda_GDL 默认为 100，和 L1 保持 1:1 的比例通常效果最好
-        self.loss_G_GDL = self.criterionGDL(self.fake_B, self.real_B) * self.opt.lambda_GDL
-        
-        # 4. 总 Loss
-        self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_GDL
-        
+        self.loss_G = self.loss_G_GAN + self.loss_G_L1
         self.loss_G.backward()
 
     def optimize_parameters(self):
@@ -171,4 +114,4 @@ class Pix2PixModel(BaseModel):
         self.set_requires_grad(self.netD, False)
         self.optimizer_G.zero_grad()
         self.backward_G()
-        self.optimizer_G.step()
+        self.optimizer_G.step() 
