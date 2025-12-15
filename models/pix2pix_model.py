@@ -6,10 +6,7 @@ import numpy as np
 # --- 新增: 导入 Masked PSNR 计算函数 ---
 from util.util import calculate_masked_psnr
 
-
 class Pix2PixModel(BaseModel):
-    """This class implements the pix2pix model, for learning a mapping from input images to output images given paired data."""
-
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
         parser.set_defaults(norm="batch", netG="unet_256", dataset_mode="aligned")
@@ -117,4 +114,4 @@ class Pix2PixModel(BaseModel):
         self.set_requires_grad(self.netD, False)
         self.optimizer_G.zero_grad()
         self.backward_G()
-        self.optimizer_G.step()
+        self.optimizer_G.step() 
